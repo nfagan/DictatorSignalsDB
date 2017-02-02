@@ -26,7 +26,8 @@ classdef DictatorSignalsDB < DBManager
           , ' trial                     REAL NOT NULL,' ...
           , ' trialInBlock              REAL NOT NULL,' ...
           , ' trialType                 REAL NOT NULL,' ...
-          , ' outcome                   TEXT NOT NULL,' ...
+          , ' cueType                   REAL NOT NULL,' ...
+          , ' fix                       REAL NOT NULL,' ...
           , ' magnitude                 REAL NOT NULL,' ...
           , ' earlyGazeQuantity         REAL NOT NULL,' ...
           , ' earlyLookCount            REAL NOT NULL,' ...
@@ -62,6 +63,7 @@ classdef DictatorSignalsDB < DBManager
         'CREATE TABLE gaze' ...
           , '(id        INT PRIMARY KEY NOT NULL,' ...
           , ' session   TEXT NOT NULL,' ...
+          , ' folder    INT NOT NULL,' ...
           , ' t         TEXT NOT NULL,' ...
           , ' x         TEXT NOT NULL,' ...
           , ' y         TEXT NOT NULL,' ...
@@ -85,10 +87,13 @@ classdef DictatorSignalsDB < DBManager
     %   DEFINE FIELDS THAT ARE NOT REQUIRED TO BE IN THE PICTO DATA FILES
     
     FIELDS_NOT_IN_KEYS = struct( ...
-      'trial_info', {{ 'id', 'session', 'folder', 'outcome' }}, ...
+      'trial_info', {{ 'id', 'session', 'folder' }}, ...
       'events',     {{ 'id', 'session', 'folder' }}, ...
-      'meta',       {{ 'id', 'session' }} ...
+      'meta',       {{ 'id', 'session' }}, ...
+      'gaze',       {{ 'id', 'session', 'folder' }} ...
     );
+  
+    REQUIRED_GAZE_FILES = struct( 't', '.t.txt', 'x', '.x.txt', 'y', '.y.txt' );
     
   end
   
@@ -161,12 +166,88 @@ classdef DictatorSignalsDB < DBManager
           obj = commit( obj );
         catch err
           obj = rollback( obj );
+          fprintf( ['\n ! DictatorSignalsDB/ADD_DATA: The following error' ...
+            , ' occurred when attempting to add data to the database in folder' ...
+            , ' ''%s''; no data in this folder will be added:\n\n'], folders{i} );
           error( err.message );
         end
       end
     end
     
+    %{
+        DICTATOR-SPECIFIC QUERIES
+    %}
+    
+    function obj = delete_sessions(obj, targets)
+      
+      %   DELETE_SESSIONS -- Remove rows in all tables associated with the
+      %     desired sessions.
+      %
+      %     An error is thrown if even one of the targets is not in the
+      %     database.
+      %
+      %     IN:
+      %       - `targets` (cell array of strings, char) -- Sessions to
+      %         remove.
+      
+      targets = DBManager.ensure_cell( targets );
+      assert( iscellstr(targets), ['Specify sessions as a cell array of' ...
+        , ' strings, or a char'] );
+      sessions = get_fields( obj, 'session', 'signals' );
+      exists = cellfun( @(x) find(strcmp(sessions,x)), targets, 'un', false );
+      all_exist = all( cellfun(@(x) ~isempty(x), exists) );
+      assert( all_exist, 'At least one of the specified sessions is not in the database ''%s''' ...
+        , session, obj.filename );
+      tables = get_table_names( obj );
+      for i = 1:numel( targets )
+        for k = 1:tables
+          query = sprintf( 'DELETE FROM %s WHERE sessions="%s"', tables{k}, targets{i} );
+          obj = exec( obj, query );
+        end
+      end
+    end
+    
+    function data = get_fields_where_session(obj, field_names, table_name, session)
+      
+      %   GET_FIELDS_WHERE_SESSION -- Shortcut function to get the fields
+      %     of a table associated with a single session.
+      %
+      %     IN:
+      %       - `field_names` (cell array of strings, char) -- Fields to
+      %         obtain. Specify '*' for all fields.
+      %       - `table_name` (char) -- Table in which the fields reside.
+      %       - `session` (char) -- Session to select.
+      %     OUT:
+      %       - `data` (cell array) -- Desired fields, filtered to only
+      %         those matching `session`. Will equal { 'No Data' } if no
+      %         matching data is found.
+      
+      assert( isa(session, 'char'), 'Session must be a string; was a ''%s''' ...
+        , class(session) );
+      data = get_fields_where( obj, field_names, table_name, {'session', session} );      
+    end
+    
+    %{
+        ADD DATA
+    %}
+    
     function obj = add_data_per_subfolder(obj, folder, subfolder, meta_data, channels)
+      
+      %   ADD_DATA_PER_SUBFOLDER -- Main subroutine which processes an
+      %     individual session folder.
+      %
+      %     IN:
+      %       - `folder` (char) -- Path to the outer-folder, containing
+      %         multiple sessions.
+      %       - `subfolder` (char) -- Name of the session folder.
+      %       - `meta_data` (struct, []) -- The meta data loaded from
+      %         .meta.txt in the outer-folder, or [] if that file does not
+      %         exist. If [], there must be a .meta.txt file present in
+      %         `subfolder`.
+      %       - `channels` (struct, []) -- The channel data loaded from
+      %         .channels.txt in the outer-folder, or [] if that file does
+      %         not exist. If [], there must be a .channels.txt file
+      %         present in `subfolder.`
       
       msg__wrong_n_files = 'More or fewer than one %s found in subfolder ''%s''';
       folder_path = fullfile( folder, subfolder );
@@ -175,10 +256,17 @@ classdef DictatorSignalsDB < DBManager
       meta_file = dirstruct( folder_path, '.meta.txt' );
       channel_file = dirstruct( folder_path, '.channels.txt' );
       sqlite_file = dirstruct( folder_path, '.sqlite' );
+      csv_file = dirstruct( folder_path, '.csv' );
 
       assert( numel(behav_data) == 1, msg__wrong_n_files, 'sub-subfolder', subfolder );
       assert( numel(pl2) == 1, msg__wrong_n_files, 'pl2 file', subfolder );
-      assert( numel(sqlite_file) == 1, msg__wrong_n_files, 'sqlite file', subfolder );
+      if ( numel(sqlite_file) == 0 )
+        assert( numel(csv_file) == 1, msg__wrong_n_files, 'csv file', subfolder );
+        use_csv_to_align = true;
+      else
+        assert( numel(sqlite_file) == 1, msg__wrong_n_files, 'sqlite file', subfolder );
+        use_csv_to_align = false;
+      end
 
       behav_subfolders = dirstruct( ...
         fullfile(folder_path, behav_data(1).name), 'folders' );
@@ -305,8 +393,8 @@ classdef DictatorSignalsDB < DBManager
 
       for k = 1:numel(behav_subfolders)
 
-        fprintf( ['\n\t ! DictatorSignalsDB/add_data_per_folder: Processing' ...
-          , ' Trial Info in Subfolder %d of %d'], k, numel(behav_subfolders) );
+        fprintf( '\n\t - Processing Trial Info in Subfolder %d of %d' ...
+          , k, numel(behav_subfolders) );
 
         %   make sure we can find the files
         current_subfolder_path = ...
@@ -355,7 +443,6 @@ classdef DictatorSignalsDB < DBManager
           complete_row( strcmp(all_trial_fields, 'session') ) = { ...
             sprintf('"%s"', meta_data.session) };
           complete_row( strcmp(all_trial_fields, 'folder') ) = { num2str(k) };
-          complete_row( strcmp(all_trial_fields, 'outcome') ) = { '"self"' };
 
           obj = insert_row( obj, 'trial_info', complete_row );
         end
@@ -373,8 +460,7 @@ classdef DictatorSignalsDB < DBManager
 
       for k = 1:numel(behav_subfolders)
 
-        fprintf( ['\n\t ! DictatorSignalsDB/add_data_per_folder: Processing' ...
-          , ' Events in Subfolder %d of %d'], k, numel(behav_subfolders) );
+        fprintf( '\n\t - Processing Events in Subfolder %d of %d', k, numel(behav_subfolders) );
 
         current_subfolder_path = ...
           fullfile( folder_path, behav_data(1).name, behav_subfolders(k).name );
@@ -415,15 +501,26 @@ classdef DictatorSignalsDB < DBManager
       end
 
       %   ALIGNMENT
+      
+      fprintf( '\n\t - Processing Align Tables' );
 
-      sqlite_manager = DBManager( folder_path, sqlite_file(1).name );
-      sqlite_manager = connect( sqlite_manager );
-      align_data = exec_and_gather( sqlite_manager, ...
-        'SELECT neuraltime,behavioralTime FROM alignevents' );
-      sqlite_manager = close( sqlite_manager );
-      if ( isequal(align_data{1}, 'No Data') )
-        error( 'No valid alignment data found in the database file in ''%s''', ...
-          subfolder );
+      if ( ~use_csv_to_align )
+        sqlite_manager = DBManager( folder_path, sqlite_file(1).name );
+        sqlite_manager = connect( sqlite_manager );
+        align_data = exec_and_gather( sqlite_manager, ...
+          'SELECT neuraltime,behavioralTime FROM alignevents' );
+        sqlite_manager = close( sqlite_manager );
+        if ( isequal(align_data{1}, 'No Data') )
+          error( 'No valid alignment data found in the database file in ''%s''', ...
+            subfolder );
+        end
+      else
+        mat_align_data = csvread( fullfile(folder_path, csv_file(1).name) );
+        mat_align_data = mat_align_data( :, 1:2 );
+        align_data = cell( size(mat_align_data) );
+        for k = 1:numel(align_data)
+          align_data{k} = mat_align_data(k);
+        end
       end
 
       align_fields = get_field_names( obj, 'align' );
@@ -441,8 +538,41 @@ classdef DictatorSignalsDB < DBManager
           { num2str(align_data{k,2}) };
         obj = insert_row( obj, 'align', complete_row );
       end
+      
+      %   GAZE
+      
+      fprintf( '\n\t - Processing Gaze Files' );
+      
+      gaze_tbl_fields = get_field_names( obj, 'gaze' );
+      gaze_text_fields = fieldnames( obj.REQUIRED_GAZE_FILES );
+      for k = 1:numel( behav_subfolders )
+        for j = 1:numel( gaze_text_fields )
+          gaze_txt_file_ext = obj.REQUIRED_GAZE_FILES.( gaze_text_fields{j} );
+          full_subfolder_path = ...
+            fullfile( folder, subfolder, behav_data(1).name, behav_subfolders(k).name );
+          gaze_txt_file = dirstruct( full_subfolder_path, gaze_txt_file_ext );
+          assert( numel(gaze_txt_file) == 1, msg__wrong_n_files ...
+            , gaze_text_fields{j}, subfolder );
+          gaze_text_paths.(gaze_text_fields{j}) = ...
+            fullfile( full_subfolder_path, gaze_txt_file(1).name );
+        end
+        row = get_n_rows( obj, 'gaze' );
+        complete_row = cell( 1, numel(gaze_tbl_fields) );
+        for j = 1:numel(gaze_text_fields)
+          current_txt_field = gaze_text_fields{j};
+          complete_row( strcmp(gaze_tbl_fields, current_txt_field) ) = ...
+            { sprintf('"%s"', gaze_text_paths.(current_txt_field)) };
+        end
+        complete_row( strcmp(gaze_tbl_fields, 'id') ) = { num2str(row) };
+        complete_row( strcmp(gaze_tbl_fields, 'session') ) = { ...
+          sprintf( '"%s"', meta_data.session) };
+        complete_row( strcmp(gaze_tbl_fields, 'folder') ) = { num2str(k) };
+        obj = insert_row( obj, 'gaze', complete_row );
+      end
 
       %   META
+      
+      fprintf( '\n\t - Processing Meta Data' );
 
       row = get_n_rows( obj, 'meta' );
       meta_tbl_fields = get_field_names( obj, 'meta' );
@@ -489,8 +619,7 @@ classdef DictatorSignalsDB < DBManager
       end
       
       for i = 1:numel(folders)
-        fprintf( ['\n ! DictatorSignalsDB/add_data_per_folder: Processing' ...
-          , ' folder ''%s'' (%d of %d)'], folders(i).name, i, numel(folders) );
+        fprintf( '\n - Processing folder ''%s'' (%d of %d)', folders(i).name, i, numel(folders) );
         obj = add_data_per_subfolder(obj, folder, folders(i).name, meta_data, channels ); continue;
       end
     end
