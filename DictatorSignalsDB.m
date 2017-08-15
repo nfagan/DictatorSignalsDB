@@ -144,7 +144,7 @@ classdef DictatorSignalsDB < DBManager
       obj = CREATE_TABLES( obj );
     end
     
-    function obj = ADD_DATA(obj, folders)
+    function obj = ADD_DATA(obj, folders, prompt_to_overwrite)
       
       %   ADD_DATA -- Import data into the database from the given
       %     processed folders.
@@ -155,14 +155,17 @@ classdef DictatorSignalsDB < DBManager
       %     IN:
       %       - `folders` (cell array of strings) -- Folders from which to
       %         add data.
+      %       - `prompt_to_overwrite` (true, false) -- If false, existing
+      %         sessions will automatically be skipped.
       
       if ( ~iscell(folders) ), folders = { folders }; end;
       assert( iscellstr(folders), ['Specify folders as a cell array of strings' ...
         , ' or a single string'] );
+      if ( nargin < 3 ), prompt_to_overwrite = true; end;
       for i = 1:numel(folders)
         try
           obj = begin( obj );
-          obj = add_data_per_folder( obj, folders{i} );
+          obj = add_data_per_folder( obj, folders{i}, prompt_to_overwrite );
           obj = commit( obj );
         catch err
           obj = rollback( obj );
@@ -197,11 +200,11 @@ classdef DictatorSignalsDB < DBManager
       exists = cellfun( @(x) find(strcmp(sessions,x)), targets, 'un', false );
       all_exist = all( cellfun(@(x) ~isempty(x), exists) );
       assert( all_exist, 'At least one of the specified sessions is not in the database ''%s''' ...
-        , session, obj.filename );
+        , obj.filename );
       tables = get_table_names( obj );
       for i = 1:numel( targets )
-        for k = 1:tables
-          query = sprintf( 'DELETE FROM %s WHERE sessions="%s"', tables{k}, targets{i} );
+        for k = 1:numel( tables )
+          query = sprintf( 'DELETE FROM %s WHERE session="%s"', tables{k}, targets{i} );
           obj = exec( obj, query );
         end
       end
@@ -227,11 +230,37 @@ classdef DictatorSignalsDB < DBManager
       data = get_fields_where( obj, field_names, table_name, {'session', session} );      
     end
     
+    function sessions_by_day = get_sessions_by_day(obj)
+      
+      %   GET_SESSIONS_BY_DAY -- Return a cell array of session labels
+      %     grouped by day.
+      %
+      %     In most cases, a day is the same as a session; but in the past,
+      %     there were multiple sessions (multiple .pl2 files) per day.
+      %
+      %     Throws an error if the database is empty.
+      %
+      %     OUT:
+      %       - `sessions_by_day` (cell array of cell arrays of strings)      
+      
+      sessions = unique( get_fields(obj, 'session', 'signals') );
+      if ( isequal(sessions{1}, 'No Data') )
+        error( 'No sessions are currently in the database' );
+      end      
+      days = unique( cellfun(@(x) x(3:10), sessions, 'un', false) );
+      sessions_by_day = cell( size(days) );
+      for i = 1:numel(days)
+        matches = cellfun( @(x) ~isempty(strfind(x, days{i})), sessions );
+        sessions_by_day{i} = sessions( matches );
+      end
+    end
+    
     %{
         ADD DATA
     %}
     
-    function obj = add_data_per_subfolder(obj, folder, subfolder, meta_data, channels)
+    function obj = add_data_per_subfolder(obj, folder, subfolder, meta_data ...
+        , channels, prompt_to_overwrite)
       
       %   ADD_DATA_PER_SUBFOLDER -- Main subroutine which processes an
       %     individual session folder.
@@ -248,6 +277,8 @@ classdef DictatorSignalsDB < DBManager
       %         .channels.txt in the outer-folder, or [] if that file does
       %         not exist. If [], there must be a .channels.txt file
       %         present in `subfolder.`
+      %       - `prompt_to_overwrite` (true, false) -- If false, existing
+      %         sessions will automatically be skipped.
       
       msg__wrong_n_files = 'More or fewer than one %s found in subfolder ''%s''';
       folder_path = fullfile( folder, subfolder );
@@ -290,7 +321,11 @@ classdef DictatorSignalsDB < DBManager
         assert( numel(meta_file) == 1, msg__wrong_n_files, 'meta file', subfolder );
         further_meta_data = DBManager.csv_cell_to_struct( ...
           fullfile(folder_path, meta_file(1).name) );
-        meta_data = structconcat( meta_data, further_meta_data, '-overwrite' );
+        if ( ~isempty(meta_data) )
+          meta_data = structconcat( meta_data, further_meta_data, '-overwrite' );
+        else
+          meta_data = further_meta_data;
+        end
       else
         assert( ~isempty(meta_data), [ 'No .meta.txt file' ...
           , ' was found in the sub-subfolder ''%s'', or in the subfolder ''%s'''] ...
@@ -323,14 +358,21 @@ classdef DictatorSignalsDB < DBManager
       end
 
       if ( session_exists )
-        prompt = sprintf(['\n ! DictatorSignalsDB/ADD_DATA/add_data_per_folder:' ...
-          , '\n\tThe session ''%s'' already exists in the database. Are you sure' ...
-          , '\n\tyou wish to add more data associated with it? (y/n)\n'] ...
-          , meta_data.session );
-        while ( true )
-          response = input( prompt, 's' );
-          if ( isequal(lower(response), 'n') ), do_continue = false; break; end;
-          if ( isequal(lower(response), 'y') ), do_continue = true; break; end;
+        if ( prompt_to_overwrite )
+          prompt = sprintf(['\n ! DictatorSignalsDB/ADD_DATA/add_data_per_folder:' ...
+            , '\n\tThe session ''%s'' already exists in the database. Are you sure' ...
+            , '\n\tyou wish to add more data associated with it? (y/n)\n'] ...
+            , meta_data.session );
+          while ( true )
+            response = input( prompt, 's' );
+            if ( isequal(lower(response), 'n') ), do_continue = false; break; end;
+            if ( isequal(lower(response), 'y') ), do_continue = true; break; end;
+          end
+        else
+          fprintf( ['\n ! DictatorSignalsDB/ADD_DATA/add_data_per_folder:' ...
+            , '\n\tSkipping session ''%s'' because data already exist ...'] ...
+            , meta_data.session );
+          do_continue = false;
         end
         if ( ~do_continue ), return; end;
       end
@@ -587,13 +629,15 @@ classdef DictatorSignalsDB < DBManager
       
     end
     
-    function obj = add_data_per_folder(obj, folder)
+    function obj = add_data_per_folder(obj, folder, prompt_to_overwrite)
       
       %   ADD_DATA_PER_FOLDER -- Subroutine which reads in data from a
       %     single subfolder.
       %
       %     IN:
       %       - `folder` (char) -- Valid path to a subfolder.
+      %       - `prompt_to_overwrite` (true, false) -- If false, existing
+      %         sessions will automatically be skipped.
       
       folders = dirstruct( folder, 'folders' );
       assert( ~isempty(folders), 'No subfolders were found in outerfolder ''%s''' ...
@@ -620,7 +664,9 @@ classdef DictatorSignalsDB < DBManager
       
       for i = 1:numel(folders)
         fprintf( '\n - Processing folder ''%s'' (%d of %d)', folders(i).name, i, numel(folders) );
-        obj = add_data_per_subfolder(obj, folder, folders(i).name, meta_data, channels ); continue;
+        obj = add_data_per_subfolder(obj, folder, folders(i).name, meta_data ...
+          , channels, prompt_to_overwrite ); 
+        continue;
       end
     end
   end
